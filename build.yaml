@@ -1,0 +1,195 @@
+name: "Go CI"
+on:
+    # If you'd like a "simple" build pipeline that does
+    # not have parallelized builds, this will run in linear
+    # fashion.
+  push:
+    branches: [ st-ti-2309 ]
+    #tags:
+     # - 'v[0-9]+.[0-9]+.[0-9]+'
+  #schedule:
+    # This will trigger github.event_name == 'schedule' to ensure nightly rebuilds
+   # - cron: 0 0 * * *
+jobs:
+  test:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions/cache@v2
+        id: generated-files-cache
+        with:
+          path: ./gen
+          key: ${{ runner.os }}-${{ hashFiles('./swagger.yaml', './messages.yaml') }}
+
+      - name: "Install SSH key"
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.MERITINFRA_GITHUB_KEY }}
+          known_hosts: 'dummy'
+          name: id_rsa # optional
+          if_key_exists: fail
+
+      - name: "Add github as known host"
+        run: ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+      - name: "Configure GitHub to use private go modules"
+        run: git config --global url."git@github.com:merit".insteadOf https://github.com/merit
+
+      # goimports to cleanup imports in generated files
+      - name: "Install goimports"
+        if: ${{ steps.generated-files-cache.outputs.cache-hit != 'true' }}
+        # TODO: remove GO111MODULE=off once we update to go v1.16
+        # and start using go install in order to avoid affecting go.mod for application code
+        run: |
+          GO111MODULE=off go get golang.org/x/tools/cmd/goimports
+          echo $(go env GOPATH)/bin >> $GITHUB_PATH
+
+      - name: "Run generate"
+        id: generate
+        if: ${{ steps.generated-files-cache.outputs.cache-hit != 'true' }}
+        run: make generate
+
+      - name: "Run setup"
+        run: make setup
+        env:
+          GIT_TERMINAL _PROMPT: 1
+          GOPRIVATE: "github.com/merit"
+
+      - name: Make Test
+        run: make test
+
+      - name: Archive test report
+        uses: actions/upload-artifact@v2
+        with:
+          name: "test-coverage"
+          path: |
+            ${{ github.workspace }}/coverage/test_report.json
+            ${{ github.workspace }}/coverage/coverage.out
+
+      - name: Make DB Test
+        run: |
+          make liquibase-commit
+          make db-test
+        env:
+          POSTGRES_DB: ${{ secrets.TEST_DB }}
+          POSTGRES_USER: ${{ secrets.TEST_DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+
+      - name: Archive test report
+        uses: actions/upload-artifact@v2
+        with:
+            name: "db-test-coverage"
+            path: |
+              ${{ github.workspace }}/coverage/db_test_report.json
+              ${{ github.workspace }}/coverage/db_coverage.out
+
+      - name: Consumer contract test
+        run: make contract-consumer-test
+
+      - name: Provider contract test
+        run: make contract-provider-test
+        env:
+          POSTGRES_DB: ${{ secrets.TEST_DB }}
+          POSTGRES_USER: ${{ secrets.TEST_DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+
+      - name: Analyze with SonarCloud
+        uses: sonarsource/sonarcloud-github-action@v1.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONARCLOUD_API_TOKEN }}
+  publish:
+    runs-on: ubuntu-20.04
+    needs: [test]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions/cache@v2
+        id: generated-files-cache
+        with:
+          path: ./gen
+          key: ${{ runner.os }}-${{ hashFiles('./swagger.yaml', './messages.yaml') }}
+
+      - name: "Install SSH key"
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.MERITINFRA_GITHUB_KEY }}
+          name: id_rsa # optional
+          known_hosts: 'dummy'
+          if_key_exists: fail
+
+      - name: "Add github as known host"
+        run: ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+      - name: "Configure GitHub to use private go modules"
+        run: git config --global url."git@github.com:merit".insteadOf https://github.com/merit
+
+      # goimports to cleanup imports in generated files
+      - name: "Install goimports"
+        if: ${{ steps.generated-files-cache.outputs.cache-hit != 'true' }}
+        # TODO: remove GO111MODULE=off once we update to go v1.16
+        # and start using go install in order to avoid affecting go.mod for application code
+        run: |
+          GO111MODULE=off go get golang.org/x/tools/cmd/goimports
+          echo $(go env GOPATH)/bin >> $GITHUB_PATH
+
+      - name: "Run generate"
+        id: generate
+        if: ${{ steps.generated-files-cache.outputs.cache-hit != 'true' }}
+        run: make generate
+
+      - name: "Run setup"
+        run: make setup
+        env:
+          GIT_TERMINAL_PROMPT: 1
+          GOPRIVATE: "github.com/merit"
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v0.2.0
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: "Build images"
+        run: make container
+      
+      #Lacework inline scan for docker images.
+      - name: "Lacework inline scanner"
+        env: 
+          BINS: api worker
+          LW_ACCESS_TOKEN: ${{ secrets.LW_ACCESS_TOKEN }}
+          LW_ACCOUNT_NAME: ${{ secrets.LW_ACCOUNT_NAME }}
+          PROJECT:         issuance
+          REGISTRY:        us.gcr.io/mrt-issuer-d-1b41
+          ARCH:            amd64
+          OS:              linux
+        run:  | 
+              VERSION=`git describe --tags --always --dirty`
+              TAG="${VERSION}__${OS}_${ARCH}"
+              sudo apt-get update -y
+              sudo apt-get -y install curl
+              curl -L https://github.com/lacework/lacework-vulnerability-scanner/releases/latest/download/lw-scanner-linux-amd64 -o lw-scanner
+              chmod +x lw-scanner
+              for bin in $BINS; do
+                  echo "$REGISTRY/$PROJECT-$bin:$TAG"
+                   ./lw-scanner image evaluate $REGISTRY/$PROJECT-$bin $TAG --build-id ${{ github.run_id }} --save
+              done
+
+      # Configure docker to use the gcloud command-line tool as a credential helper
+      # - name: "Configure gcloud auth with docker"
+      #   run: gcloud auth configure-docker -q
+
+      # - name: "Upload docker image to gcp registry"
+      #   run: make push
+
+      # - name: "Send repository_dispatch event to stellar for deployment"
+      #   # Sends an empty client_payload object with the `event_type` `image_uploaded`
+      #   # in sync with https://github.com/merit/stellar/pull/90 which runs the deploy
+      #   run: |
+      #     curl -X POST https://api.github.com/repos/merit/stellar/dispatches \
+      #                       -H 'Accept: application/vnd.github.everest-preview+json' \
+      #                       -u ${{ secrets.REPO_TOKEN }} \
+      #                      --data '{"event_type": "image_uploaded", "client_payload": {} }'
