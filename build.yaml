@@ -175,7 +175,7 @@ jobs:
               chmod +x lw-scanner
               for bin in $BINS; do
                   echo "$REGISTRY/$PROJECT-$bin:$TAG"
-                   ./lw-scanner image evaluate $REGISTRY/$PROJECT-$bin $TAG --build-id ${{ github.run_id }} --save
+                   ./lw-scanner image evaluate $REGISTRY/$PROJECT-$bin $TAG --build-id ${{ github.run_id }} --fail_on_critical --save
               done
 
       # Configure docker to use the gcloud command-line tool as a credential helper
